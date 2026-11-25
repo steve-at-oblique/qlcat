@@ -1,0 +1,420 @@
+; Copyright (c) 2026 Steve Jennen
+; SPDX-License-Identifier: BSD-2-Clause
+; Talent/Quanta 2.02, Motorola 68000
+; Native QDOS job. SEXEC data space: 1024 bytes.
+
+ql_mt_inf    equ 0
+ql_mt_frjob  equ 5
+ql_io_open   equ 1
+ql_io_close  equ 2
+ql_err_ch    equ -6
+ql_err_ef    equ -10
+ql_err_bp    equ -15
+io_fmul      equ 3
+io_sbyt      equ 5
+io_smul      equ 7
+sv_basic     equ $10
+sv_jobs      equ $68
+job_header   equ $68
+sb_vars      equ $1e8
+smsq_id      equ $534d5351         ; 'SMSQ' system variable identifier
+bv_chbas     equ $30
+bv_chtop     equ $34
+bv_chlen     equ $28
+sv_datad     equ $b0
+
+buf_len     equ 256
+path_len    equ 66                  ; 2-byte length + up to 64 path chars
+local_len   equ 10                   ; saw_cr(0), pad(1), has_path(2), pad(3)
+
+; Stack frame layout relative to A3 (path buffer base).
+in_buf      equ 0-buf_len
+out_buf     equ in_buf-buf_len
+saw_cr      equ out_buf-local_len
+has_path    equ saw_cr+1
+opt_num     equ saw_cr+2
+at_bol      equ saw_cr+3
+line_num    equ saw_cr+4
+work_area   equ saw_cr-path_len
+
+start              bra     main
+        dc.w    0
+        dc.w    $4afb,3
+        dc.b    'CAT',0
+
+main
+        ; Find channel #1 in job zero's SuperBASIC channel table.
+        moveq   #ql_mt_inf,d0
+        trap    #1
+        movea.l a0,a5
+        moveq   #1,d1
+        bsr     get_channel
+        tst.l   d0
+        bne     exit_job
+
+        movea.l a7,a1              ; original EXEC stack
+        lea     work_area(a7),a7
+        lea     local_len(a7),a6   ; A6 = out_buf
+        lea     buf_len(a6),a3     ; A3 = in_buf
+        lea     buf_len(a3),a3     ; A3 = path_buf (QDOS string)
+        clr.l   saw_cr(a3)         ; clears saw_cr, has_path, opt_numb, at_bol
+        move.b  #1,at_bol(a3)      ; start at beginning of line 1
+        moveq   #1,d0
+        move.l  d0,line_num(a3)    ; line_num =1
+        clr.w   (a3)
+        bsr     parse_args
+
+        tst.l   d0
+        bne     exit_job
+        tst.b   has_path(a3)
+        beq     bad_param
+
+        ; Lead with a newline on the output channel, matching LS/DIR.
+        movea.l a4,a0
+        moveq   #10,d1
+        moveq   #-1,d3
+        moveq   #io_sbyt,d0
+        trap    #3
+        tst.l   d0
+        bne     exit_job
+
+        ; Open input file (shared read, D3 = 1). If no device prefix was
+        ; supplied and DATA_USE is set, prepend DATA_USE first.
+        bsr     resolve_path
+        movea.l a3,a0
+        moveq   #-1,d1
+        moveq   #1,d3
+        moveq   #ql_io_open,d0
+        trap    #2
+        tst.l   d0
+        bne     exit_job
+        movea.l a0,a5              ; A5 = input file channel ID
+
+read_chunk         movea.l a5,a0
+        lea     in_buf(a3),a1
+        moveq   #0,d1
+        move.w  #buf_len,d2
+        moveq   #-1,d3
+        moveq   #io_fmul,d0
+        trap    #3
+        move.l  d0,d6              ; save trap status (may be 0 or ql_err_ef)
+        beq.s   filter_chunk
+        cmpi.l  #ql_err_ef,d0
+        bne   close_file
+        tst.w   d1
+        beq   eof_done
+
+filter_chunk       tst.w   d1
+        beq     check_eof
+        lea     in_buf(a3),a0
+        lea     out_buf(a3),a1
+        move.w  d1,d4
+        subq.w  #1,d4
+        move.b  saw_cr(a3),d5
+
+filter_byte        move.b  (a0)+,d0
+        cmpi.b  #13,d0             ; CR ($0D) -> emit LF ($0A), remember CR
+        bne.s   not_cr
+        bsr     maybe_num          ; number of blank lines too
+        bne     close_file
+        move.b  #10,(a1)+
+        move.b  #1,at_bol(a3)     ; next char starts a new line
+        moveq   #1,d5
+        bra.s   next_byte
+
+not_cr             cmpi.b  #10,d0             ; LF ($0A) -> skip if preceded by CR
+        bne.s   clear_cr
+        tst.b   d5
+        beq.s   emit_lf
+        moveq   #0,d5
+        bra.s   next_byte
+emit_lf         bsr.s  maybe_num
+        bne     close_file           
+        move.b  #10,(a1)+
+        move.b  #1,at_bol(a3)
+        bra.s   next_byte
+
+clear_cr           moveq   #0,d5
+        cmpi.b  #9,d0              ; allow TAB ($09)
+        beq.s   emit_char
+        cmpi.b  #32,d0             ; strip control codes < $20
+        bcs.s   next_byte
+        cmpi.b  #127,d0            ; strip DEL ($7F), allow $20-$7E and $80-$FF
+        beq.s   next_byte
+emit_char          bsr.s  maybe_num
+        bne     close_file
+        move.b  d0,(a1)+
+
+next_byte          dbra    d4,filter_byte
+        move.b  d5,saw_cr(a3)
+
+        ; Write filtered bytes to output channel A4.
+        move.l  a1,d2              ; D2 = end of emitted bytes in out_buf
+        lea     out_buf(a3),a1     ; A1 = start of out_buf
+        sub.l   a1,d2              ; D2.W = byte count to send
+        beq.s   check_eof
+        movea.l a4,a0
+        moveq   #-1,d3
+        moveq   #io_smul,d0
+        trap    #3
+        tst.l   d0
+        bne   close_file
+
+check_eof          cmpi.l  #ql_err_ef,d6
+        bne     read_chunk
+        bra     eof_done
+
+; If -n is active and at_bol is set, flush out_buf if needed and emit "   12 ".
+; Preserves D0, D4, D5, A0. Returns D0 = 0 on success (or QDOS error).
+maybe_num          tst.b   opt_num(a3)
+        beq.s   mn_ok
+        tst.b   at_bol(a3)
+        beq.s   mn_ok
+        clr.b   at_bol(a3)
+        movem.l d0/d4-d5/a0,-(a7)
+        lea     in_buf-16(a3),a0   ; ensure >= 16 bytes free in out_buf
+        cmpa.l  a0,a1
+        bcs.s   mn_format
+        bsr.s   flush_out
+        bne.s   mn_done
+mn_format          move.l  line_num(a3),d0
+        addq.l  #1,line_num(a3)
+        lea     num_powers(pc),a0
+        moveq   #0,d5              ; leading-zero suppression flag
+        moveq   #3,d4              ; 4 power-of-10 digits (10000..10)
+mn_digit           moveq   #0,d1
+        move.l  (a0)+,d2
+mn_sub             cmp.l   d2,d0
+        bcs.s   mn_emit
+        sub.l   d2,d0
+        addq.w  #1,d1
+        bra.s   mn_sub
+mn_emit            or.b    d1,d5
+        bne.s   mn_asc
+        move.b  #-16,d1            ; space after adding '0'
+mn_asc             addi.b  #48,d1
+        move.b  d1,(a1)+
+        dbra    d4,mn_digit
+        addi.b  #48,d0             ; units digit (always printed)
+        move.b  d0,(a1)+
+        move.b  #' ',(a1)+
+        moveq   #0,d0
+mn_done            movem.l (a7)+,d0/d4-d5/a0
+        rts
+mn_ok              cmp.b   d0,d0
+        rts
+
+; Send out_buf..A1 to channel A4 and reset A1 = out_buf.
+; Preserves D4, D5, A0. Returns D0 = QDOS status (Z flag set on 0).
+flush_out          movem.l d4-d5/a0,-(a7)
+        move.l  a1,d2
+        lea     out_buf(a3),a1
+        sub.l   a1,d2
+        beq.s   fo_ok
+        movea.l a4,a0
+        moveq   #-1,d3
+        moveq   #io_smul,d0
+        trap    #3
+        lea     out_buf(a3),a1
+        tst.l   d0
+        movem.l (a7)+,d4-d5/a0
+        rts
+fo_ok              moveq   #0,d0
+        movem.l (a7)+,d4-d5/a0
+        rts
+
+eof_done           moveq   #0,d6
+
+close_file         movea.l a5,a0
+        moveq   #ql_io_close,d0
+        trap    #2
+        move.l  d6,d0
+
+exit_job           move.l  d0,d3
+remove_job         moveq   #-1,d1
+        moveq   #ql_mt_frjob,d0
+        trap    #1
+
+bad_param          moveq   #ql_err_bp,d0
+        bra.s   exit_job
+
+; If path in (A3) has no underscore and DATA_USE is set, prepend DATA_USE.
+resolve_path       move.w  (a3),d1
+        beq.s   rp_done
+        lea     2(a3),a0
+        move.w  d1,d0
+        subq.w  #1,d0
+rp_scan            cmpi.b  #'_',(a0)+
+        beq.s   rp_done            ; already has a device/directory prefix
+        dbra    d0,rp_scan
+
+        move.l  sv_datad(a5),d0
+        beq.s   rp_done
+        movea.l d0,a0
+        move.w  (a0)+,d2           ; D2 = length of DATA_USE string
+        beq.s   rp_done
+        move.w  d1,d0
+        add.w   d2,d0
+        cmpi.w  #path_len-2,d0
+        bhi.s   rp_done            ; too long, leave as-is for IO.OPEN
+
+        ; Shift existing filename right by D2 bytes to make room at 2(A3).
+        lea     2(a3,d1.w),a1      ; old end
+        lea     2(a3,d0.w),a2      ; new end
+        move.w  d1,d3
+        subq.w  #1,d3
+rp_shift           move.b  -(a1),-(a2)
+        dbra    d3,rp_shift
+
+        ; Copy DATA_USE prefix into 2(A3).
+        lea     2(a3),a1
+        move.w  d2,d3
+        subq.w  #1,d3
+rp_prefix          move.b  (a0)+,(a1)+
+        dbra    d3,rp_prefix
+        move.w  d0,(a3)
+rp_done            rts
+
+; EXEC passes a word count, that many long channel IDs, then a QDOS string.
+parse_args         moveq   #0,d0
+        move.w  (a1)+,d0
+        beq.s   pa_string
+        movea.l (a1),a4            ; first passed channel overrides #1
+pa_string          lsl.l   #2,d0
+        adda.l  d0,a1
+        moveq   #0,d0
+        move.w  (a1)+,d0
+        lea     0(a1,d0.l),a2
+arg_next           cmpa.l  a2,a1
+        beq     args_done
+        move.b  (a1)+,d0
+        bsr     arg_space
+        beq.s   arg_next
+        cmpi.b  #'#',d0
+        beq.s   arg_channel
+        cmpi.b  #'-',d0
+        bne     arg_path           ; <-- changed from beq arg_error
+        cmpa.l  a2,a1              ; <-- added option parser
+        beq     arg_error          ; <--
+        bsr     is_space           ; <--
+        beq     arg_error          ; <--
+arg_option         move.b  (a1)+,d0           ; <--
+        cmpi.b  #'n',d0            ; <--
+        bne     arg_error          ; <--
+        move.b  #1,opt_num(a3)     ; <--
+        cmpa.l  a2,a1              ; <--
+        beq     args_done          ; <--
+        bsr     is_space           ; <--
+        bne.s   arg_option         ; <--
+        bra.s   arg_next           ; <--        
+
+arg_channel        moveq   #0,d1
+        moveq   #0,d2
+chan_digit         cmpa.l  a2,a1
+        beq.s   chan_done
+        move.b  (a1),d0
+        subi.b  #'0',d0
+        bcs.s   chan_sep
+        cmpi.b  #9,d0
+        bhi.s   chan_sep
+        addq.l  #1,a1
+        moveq   #1,d2
+        cmpi.w  #255,d1
+        bhi     arg_error
+        mulu.w  #10,d1
+        ext.w   d0
+        add.w   d0,d1
+        bra.s   chan_digit
+
+chan_sep           cmpi.b  #',',(a1)
+        bne.s   chan_check_sp
+        addq.l  #1,a1
+        bra.s   chan_done
+chan_check_sp      bsr     is_space
+        bne     arg_error
+
+chan_done          tst.w   d2
+        beq     arg_error
+        bsr     get_channel
+        tst.l   d0
+        bne.s   chan_fail
+        bra     arg_next
+chan_fail          rts
+
+; Look up SuperBASIC channel #D1.W in job 0's channel table.
+; Expects A5 = sysvars. Returns A4 = QDOS channel ID, D0 = 0 (or ql_err_ch).
+get_channel        movem.l a1,-(a7)
+        cmpi.l  #smsq_id,(a5)
+        beq.s   gc_smsq
+        movea.l sv_basic(a5),a1
+        lea     job_header(a1),a1
+        bra.s   gc_lookup
+
+gc_smsq            movea.l sv_jobs(a5),a1
+        movea.l (a1),a1
+        lea     sb_vars(a1),a1
+
+gc_lookup          mulu.w  #bv_chlen,d1
+        move.l  bv_chbas(a1),d0
+        add.l   d1,d0
+        cmp.l   bv_chtop(a1),d0
+        bcc.s   gc_bad
+        adda.l  d0,a1
+        move.l  (a1),d0
+        tst.w   d0
+        bmi.s   gc_bad
+        movea.l d0,a4
+        moveq   #0,d0
+        movem.l (a7)+,a1
+        rts
+
+gc_bad             moveq   #ql_err_ch,d0
+        movem.l (a7)+,a1
+        rts
+
+arg_path           tst.b   has_path(a3)
+        bne.s   arg_error          ; only one file operand
+        lea     2(a3),a0
+        moveq   #0,d1
+        moveq   #0,d2
+        cmpi.b  #34,d0
+        bne.s   path_copy
+        move.b  d0,d2
+        bra.s   path_next
+path_copy          cmpi.w  #path_len-2,d1
+        beq.s   arg_error
+        move.b  d0,(a0)+
+        addq.w  #1,d1
+path_next          cmpa.l  a2,a1
+        beq.s   path_end
+        move.b  (a1)+,d0
+        tst.b   d2
+        beq.s   path_word
+        cmp.b   d2,d0
+        bne.s   path_copy
+        moveq   #0,d2
+        cmpa.l  a2,a1
+        beq.s   path_end
+        bsr.s   is_space
+        bne.s   arg_error
+        bra.s   path_end
+path_word          bsr.s   arg_space
+        bne.s   path_copy
+path_end           tst.b   d2
+        bne.s   arg_error
+        tst.w   d1
+        beq.s   arg_error
+        move.w  d1,(a3)
+        move.b  #1,has_path(a3)
+        bra     arg_next
+args_done          moveq   #0,d0
+        rts
+arg_error          moveq   #ql_err_bp,d0
+        rts
+is_space           move.b  (a1),d0
+arg_space          cmpi.b  #' ',d0
+        beq.s   space_ok
+        cmpi.b  #9,d0
+space_ok           rts
+num_powers   dc.l   10000,1000,100,10
+        end
