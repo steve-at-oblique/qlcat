@@ -76,8 +76,9 @@ str_done           rts
 
 cat_cmd            move.l  a5,d7
         sub.l   a3,d7
-        cmpi.l  #8,d7               ; require exactly one file argument
-        bne     bad_param
+        beq     bad_param           ; <-- changed: require at least 1 argument
+        cmpi.l  #128,d7            ; <-- changed: allow up to 16 arguments (like ls_rext)
+        bhi     bad_param           ; <-- changed
         move.l  #work_len,d1
         moveq   #-1,d2
         moveq   #$18,d0             ; MT.ALCHP
@@ -131,18 +132,29 @@ bare_name          moveq   #0,d0
 
 path_arg           tst.w   d6
         beq     launch_bp
+        moveq   #0,d2              ; <-- added: 0 = unquoted option text
+        cmpi.b  #'-',0(a6,a1.l)    ; <-- added: does argument start with '-'?
+        beq.s   arg_room           ; <-- added: pass unquoted if so
         cmpi.w  #path_max,d6
         bhi     launch_bp
-        moveq   #0,d5
+        moveq   #34,d2             ; <-- added: quote file paths (may contain spaces)
+arg_room           moveq   #0,d5
         move.w  cmd_len(a4),d5
         lea     cmd_text(a4),a2
         adda.w  d5,a2
-        add.l   d6,d5
-        addq.l  #2,d5               ; opening and closing quotes
+        tst.w   d5                 ; <-- added: insert space separator if not first arg
+        beq.s   arg_fit            ; <--
+        addq.w  #1,d5              ; <--
+arg_fit            add.l   d6,d5
         cmpi.l  #cmd_max,d5
         bhi     launch_bp
-        move.b  #34,(a2)+
-        move.w  d6,d1
+        tst.w   cmd_len(a4)        ; <-- added: write space before 2nd+ argument
+        beq.s   arg_quote          ; <--
+        move.b  #' ',(a2)+         ; <--
+arg_quote          tst.b   d2                 ; <-- added: write opening quote only for paths
+        beq.s   arg_copy           ; <--
+        move.b  d2,(a2)+           ; <--
+arg_copy           move.w  d6,d1
         subq.w  #1,d1
 path_copy          move.b  0(a6,a1.l),d0
         cmpi.b  #34,d0
@@ -152,7 +164,12 @@ path_copy          move.b  0(a6,a1.l),d0
         move.b  d0,(a2)+
         addq.l  #1,a1
         dbra    d1,path_copy
-        move.b  #34,(a2)
+        tst.b   d2                 ; <-- added: write closing quote only for paths
+        beq.s   arg_save           ; <--
+        move.b  d2,(a2)            ; <--
+        addq.w  #2,d5              ; <--
+arg_save           cmpi.w  #cmd_max,d5        ; <--
+        bhi     launch_bp          ; <--
         move.w  d5,cmd_len(a4)
         addq.l  #8,arg_cur(a4)
         bra     next_arg
