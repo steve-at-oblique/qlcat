@@ -59,8 +59,9 @@ use_done           rts
 
 ; Fetch a single BASIC string and pop the result from the arithmetic stack.
 ; Return relative text pointer A1 and length D6. BASIC may relocate A6.
-get_str            movea.w sb_gtstr,a2
+get_str            move.l  a4,-(a7)           ; <-- save A4 (JSU ROM sb_gtstr clobbers A4!)
         jsr     (a2)
+        movea.l (a7)+,a4           ; <-- restore A4
         tst.l   d0
         bne.s   str_done
         moveq   #0,d6
