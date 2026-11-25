@@ -27,7 +27,7 @@ sv_datad     equ $b0
 
 buf_len     equ 256
 path_len    equ 66                  ; 2-byte length + up to 64 path chars
-local_len   equ 16                  ; saw_cr..lineNum(10) + opt_page, pad, page_lim:W, page_cnt.W
+local_len   equ 20                  ; saw_cr..lineNum(10) + opt_page, pad, page_lim:W, page_cnt.W
 
 ; Stack frame layout relative to A3 (path buffer base).
 in_buf      equ 0-buf_len
@@ -40,6 +40,8 @@ line_num    equ saw_cr+4
 opt_page    equ saw_cr+8            ; 0=off, 1=auto window height, 2=explicit -pN
 page_lim    equ saw_cr+10           ; lines per page before -- More --
 page_cnt    equ saw_cr+12           ; lines printed on current page
+page_cols   equ saw_cr+14           ; columns per row (from IOP.WENQ / 6)
+col_cnt     equ saw_cr+16           ; current horizontal column on row
 work_area   equ saw_cr-path_len
 
 start              bra     main
@@ -122,39 +124,58 @@ filter_chunk       tst.w   d1
 filter_byte        move.b  (a0)+,d0
         cmpi.b  #13,d0             ; CR ($0D) -> emit LF ($0A), remember CR
         bne.s   not_cr
-        bsr     maybe_num          ; number of blank lines too
+        bsr     maybe_num          ; number blank lines too
         bne     close_file
         move.b  #10,(a1)+
-        move.b  #1,at_bol(a3)     ; next char starts a new line
+        move.b  #1,at_bol(a3)      ; next char starts a new line
+        clr.w   col_cnt(a3)        ; <-- reset column on newline
         moveq   #1,d5
-        bsr     on_newline         ; <-- check page limit; D0=1 means user quit
-        bne     eof_done           ; <-- exit cleanly on CTRL-SPACE / Q / ESC
-        bra.s   next_byte
+        bsr     on_newline         ; check page limit; D0=1 means user quit
+        bne     eof_done
+        bra     next_byte
 
 not_cr             cmpi.b  #10,d0             ; LF ($0A) -> skip if preceded by CR
         bne.s   clear_cr
         tst.b   d5
         beq.s   emit_lf
         moveq   #0,d5
-        bra.s   next_byte
-emit_lf         bsr.s  maybe_num
-        bne     close_file           
+        bra     next_byte
+emit_lf            bsr   maybe_num
+        bne     close_file
         move.b  #10,(a1)+
         move.b  #1,at_bol(a3)
-        bsr     on_newline         ; <-- check page limit; D0=1 means user quit
-        bne     eof_done           ; <-- exit cleanly on CTRL-SPACE / Q / ESC
+        clr.w   col_cnt(a3)        ; <-- reset column on newline
+        bsr     on_newline         ; check page limit; D0=1 means user quit
+        bne     eof_done
         bra.s   next_byte
 
 clear_cr           moveq   #0,d5
         cmpi.b  #9,d0              ; allow TAB ($09)
-        beq.s   emit_char
+        beq.s   emit_tab           ; handle tab column advance
         cmpi.b  #32,d0             ; strip control codes < $20
         bcs.s   next_byte
         cmpi.b  #127,d0            ; strip DEL ($7F), allow $20-$7E and $80-$FF
         beq.s   next_byte
-emit_char          bsr.s  maybe_num
+emit_char          bsr   maybe_num
         bne     close_file
         move.b  d0,(a1)+
+        bsr     on_col             ; advance column & count wrapped rows
+        bne     eof_done
+        bra.s   next_byte
+
+emit_tab           bsr   maybe_num          ; tab advances to multiple of 8
+        bne     close_file
+        move.b  d0,(a1)+
+        move.w  col_cnt(a3),d0
+        addi.w  #8,d0 
+        andi.w  #$fff8,d0
+        move.w  d0,col_cnt(a3)
+        cmp.w   page_cols(a3),d0
+        bcs.s   next_byte
+        clr.w   col_cnt(a3)
+        bsr     on_newline
+        bne     eof_done
+
 
 next_byte          dbra    d4,filter_byte
         move.b  d5,saw_cr(a3)
@@ -209,6 +230,7 @@ mn_asc             addi.b  #48,d1
         addi.b  #48,d0             ; units digit (always printed)
         move.b  d0,(a1)+
         move.b  #' ',(a1)+
+        addq.w  #6,col_cnt(a3)     ; 6-char line number prefix occupies 6 columns
         moveq   #0,d0
 mn_done            movem.l (a7)+,d0/d4-d5/a0
         rts
@@ -234,18 +256,25 @@ fo_ok              moveq   #0,d0
         movem.l (a7)+,d4-d5/a0
         rts
 
-; Configure page_lim(a3) if -p or -pN was given.
-init_page          move.b  opt_page(a3),d0
+; Configure page_cols(a3) and page_lim(a3) if -p or -pN was given.
+init_page          move.b  opt_page(a3),d2
         beq.s   ip_done
-        cmpi.b  #2,d0
-        beq.s   ip_done            ; explicit -pN already set page_lim
+        move.w  #80,page_cols(a3)  ; fallback width if IOP.WENQ unavailable      ; <--
         movea.l a4,a0
         lea     in_buf(a3),a1      ; 8-byte scratch for IOP.WENQ
         moveq   #-1,d3
         moveq   #iop_wenq,d0
         trap    #3
         tst.l   d0
-        bne.s   ip_disable         ; not a CON_/SCR_ window (e.g. file output)
+        bne.s   ip_check_mode      ; not a CON_/SCR_ window                     ; <--
+        moveq   #0,d0
+        move.w  0(a1),d0           ; window width in pixels                     ; <--
+        divu    #6,d0              ; 6 pixels per character column              ; <--
+        cmpi.w  #10,d0                                                          ; <--
+        bcs.s   ip_height                                                       ; <--
+        move.w  d0,page_cols(a3)                                                ; <--
+ip_height          cmpi.b  #2,d2                                                ; <--
+        beq.s   ip_done            ; explicit -pN already set page_lim
         moveq   #0,d0
         move.w  2(a1),d0           ; window height in pixels
         divu    #10,d0             ; 10 pixels per character row
@@ -255,8 +284,23 @@ init_page          move.b  opt_page(a3),d0
         moveq   #2,d0
 ip_save            move.w  d0,page_lim(a3)
         rts
-ip_disable         clr.b   opt_page(a3)
+ip_check_mode      cmpi.b  #2,d2              ; keep explicit -pN even if WENQ fails ; <--
+        beq.s   ip_done                                                         ; <--
+        clr.b   opt_page(a3)
 ip_done            rts
+
+
+; Advance col_cnt by 1; if page_cols reached, wrap to next row and call on_newline.
+on_col  tst.b   opt_page(a3)
+        beq.s   oc_ok
+        addq.w  #1,col_cnt(a3)
+        move.w  col_cnt(a3),d0
+        cmp.w   page_cols(a3),d0
+        bcs.s   oc_ok
+        clr.w   col_cnt(a3)
+        bra.s   on_newline
+oc_ok              moveq   #0,d0
+        rts
 
 ; Increment page_cnt on newline; if page_lim reached, flush and wait for key.
 ; Preserves D4, D5, A0. Returns D0 = 0 to continue, 1 to quit, <0 on I/O error.
