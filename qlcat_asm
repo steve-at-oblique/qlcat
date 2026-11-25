@@ -10,9 +10,11 @@ ql_io_close  equ 2
 ql_err_ch    equ -6
 ql_err_ef    equ -10
 ql_err_bp    equ -15
+io_fbyt      equ 1
 io_fmul      equ 3
 io_sbyt      equ 5
 io_smul      equ 7
+iop_wenq     equ $0a
 sv_basic     equ $10
 sv_jobs      equ $68
 job_header   equ $68
@@ -25,7 +27,7 @@ sv_datad     equ $b0
 
 buf_len     equ 256
 path_len    equ 66                  ; 2-byte length + up to 64 path chars
-local_len   equ 10                   ; saw_cr(0), pad(1), has_path(2), pad(3)
+local_len   equ 16                  ; saw_cr..lineNum(10) + opt_page, pad, page_lim:W, page_cnt.W
 
 ; Stack frame layout relative to A3 (path buffer base).
 in_buf      equ 0-buf_len
@@ -35,6 +37,9 @@ has_path    equ saw_cr+1
 opt_num     equ saw_cr+2
 at_bol      equ saw_cr+3
 line_num    equ saw_cr+4
+opt_page    equ saw_cr+8            ; 0=off, 1=auto window height, 2=explicit -pN
+page_lim    equ saw_cr+10           ; lines per page before -- More --
+page_cnt    equ saw_cr+12           ; lines printed on current page
 work_area   equ saw_cr-path_len
 
 start              bra     main
@@ -58,16 +63,18 @@ main
         lea     buf_len(a6),a3     ; A3 = in_buf
         lea     buf_len(a3),a3     ; A3 = path_buf (QDOS string)
         clr.l   saw_cr(a3)         ; clears saw_cr, has_path, opt_numb, at_bol
+        clr.l   opt_page(a3)       ; clears opt_page, pad, page_lim.W              ; <--
+        clr.w   page_cnt(a3)       ; clears page_cnt.W         
         move.b  #1,at_bol(a3)      ; start at beginning of line 1
         moveq   #1,d0
         move.l  d0,line_num(a3)    ; line_num =1
         clr.w   (a3)
         bsr     parse_args
-
         tst.l   d0
         bne     exit_job
         tst.b   has_path(a3)
         beq     bad_param
+        bsr     init_page          ; <-- detect window height if -p was requested
 
         ; Lead with a newline on the output channel, matching LS/DIR.
         movea.l a4,a0
@@ -120,6 +127,8 @@ filter_byte        move.b  (a0)+,d0
         move.b  #10,(a1)+
         move.b  #1,at_bol(a3)     ; next char starts a new line
         moveq   #1,d5
+        bsr     on_newline         ; <-- check page limit; D0=1 means user quit
+        bne     eof_done           ; <-- exit cleanly on CTRL-SPACE / Q / ESC
         bra.s   next_byte
 
 not_cr             cmpi.b  #10,d0             ; LF ($0A) -> skip if preceded by CR
@@ -132,6 +141,8 @@ emit_lf         bsr.s  maybe_num
         bne     close_file           
         move.b  #10,(a1)+
         move.b  #1,at_bol(a3)
+        bsr     on_newline         ; <-- check page limit; D0=1 means user quit
+        bne     eof_done           ; <-- exit cleanly on CTRL-SPACE / Q / ESC
         bra.s   next_byte
 
 clear_cr           moveq   #0,d5
@@ -175,7 +186,7 @@ maybe_num          tst.b   opt_num(a3)
         lea     in_buf-16(a3),a0   ; ensure >= 16 bytes free in out_buf
         cmpa.l  a0,a1
         bcs.s   mn_format
-        bsr.s   flush_out
+        bsr     flush_out
         bne.s   mn_done
 mn_format          move.l  line_num(a3),d0
         addq.l  #1,line_num(a3)
@@ -221,6 +232,90 @@ flush_out          movem.l d4-d5/a0,-(a7)
         rts
 fo_ok              moveq   #0,d0
         movem.l (a7)+,d4-d5/a0
+        rts
+
+; Configure page_lim(a3) if -p or -pN was given.
+init_page          move.b  opt_page(a3),d0
+        beq.s   ip_done
+        cmpi.b  #2,d0
+        beq.s   ip_done            ; explicit -pN already set page_lim
+        movea.l a4,a0
+        lea     in_buf(a3),a1      ; 8-byte scratch for IOP.WENQ
+        moveq   #-1,d3
+        moveq   #iop_wenq,d0
+        trap    #3
+        tst.l   d0
+        bne.s   ip_disable         ; not a CON_/SCR_ window (e.g. file output)
+        moveq   #0,d0
+        move.w  2(a1),d0           ; window height in pixels
+        divu    #10,d0             ; 10 pixels per character row
+        subq.w  #1,d0              ; leave 1 row for "-- More --"
+        cmpi.w  #2,d0
+        bcc.s   ip_save
+        moveq   #2,d0
+ip_save            move.w  d0,page_lim(a3)
+        rts
+ip_disable         clr.b   opt_page(a3)
+ip_done            rts
+
+; Increment page_cnt on newline; if page_lim reached, flush and wait for key.
+; Preserves D4, D5, A0. Returns D0 = 0 to continue, 1 to quit, <0 on I/O error.
+on_newline         tst.b   opt_page(a3)
+        beq     on_ok
+        addq.w  #1,page_cnt(a3)
+        move.w  page_cnt(a3),d0
+        cmp.w   page_lim(a3),d0
+        bcs.s   on_ok
+        clr.w   page_cnt(a3)
+        movem.l d4-d5/a0,-(a7)
+        bsr     flush_out
+        bne.s   on_err
+        movea.l a4,a0
+        lea     more_msg(pc),a1
+        moveq   #10,d2
+        moveq   #-1,d3
+        moveq   #io_smul,d0
+        trap    #3
+        tst.l   d0
+        bne.s   on_err
+on_wait            movea.l a4,a0
+        moveq   #-1,d3
+        moveq   #io_fbyt,d0
+        trap    #3
+        tst.l   d0
+        bne.s   on_err
+        cmpi.b  #' ',d1            ; SPACE -> next page
+        beq.s   on_cont
+        cmpi.b  #10,d1             ; ENTER -> next page
+        beq.s   on_cont
+        tst.b   d1                 ; CTRL-SPACE ($00) -> quit
+        beq.s   on_quit
+        cmpi.b  #27,d1             ; ESC ($1B) -> quit
+        beq.s   on_quit
+        ori.b   #$20,d1
+        cmpi.b  #'q',d1            ; Q / q -> quit
+        bne.s   on_wait
+on_quit            bsr.s   more_newline       ; <-- print newline after -- More --
+        lea     out_buf(a3),a1
+        moveq   #1,d0
+        movem.l (a7)+,d4-d5/a0
+        rts
+on_cont            bsr.s   more_newline       ; <-- print newline after -- More --
+        lea     out_buf(a3),a1
+        moveq   #0,d0
+        movem.l (a7)+,d4-d5/a0
+        rts
+on_err             lea     out_buf(a3),a1
+        movem.l (a7)+,d4-d5/a0
+        rts
+on_ok              moveq   #0,d0
+        rts
+
+more_newline       movea.l a4,a0              ; <-- replaces clear_more: just send LF
+        moveq   #10,d1
+        moveq   #-1,d3
+        moveq   #io_sbyt,d0
+        trap    #3
         rts
 
 eof_done           moveq   #0,d6
@@ -291,22 +386,52 @@ arg_next           cmpa.l  a2,a1
         bsr     arg_space
         beq.s   arg_next
         cmpi.b  #'#',d0
-        beq.s   arg_channel
+        beq     arg_channel
         cmpi.b  #'-',d0
-        bne     arg_path           ; <-- changed from beq arg_error
-        cmpa.l  a2,a1              ; <-- added option parser
-        beq     arg_error          ; <--
-        bsr     is_space           ; <--
-        beq     arg_error          ; <--
-arg_option         move.b  (a1)+,d0           ; <--
-        cmpi.b  #'n',d0            ; <--
-        bne     arg_error          ; <--
-        move.b  #1,opt_num(a3)     ; <--
-        cmpa.l  a2,a1              ; <--
-        beq     args_done          ; <--
-        bsr     is_space           ; <--
-        bne.s   arg_option         ; <--
-        bra.s   arg_next           ; <--        
+        bne     arg_path 
+        cmpa.l  a2,a1
+        beq     arg_error
+        bsr     is_space
+        beq     arg_error
+
+arg_option         move.b  (a1)+,d0
+        cmpi.b  #'n',d0
+        beq.s   arg_opt_n
+        cmpi.b  #'p',d0            ; <-- added -p / -pN
+        bne     arg_error
+        move.b  #1,opt_page(a3)    ; default to auto window height
+        moveq   #0,d1              ; parse optional digits after -p
+        moveq   #0,d2
+page_digit         cmpa.l  a2,a1
+        beq.s   page_done
+        move.b  (a1),d0
+        subi.b  #'0',d0
+        bcs.s   page_done
+        cmpi.b  #9,d0
+        bhi.s   page_done
+        addq.l  #1,a1
+        moveq   #1,d2
+        cmpi.w  #999,d1
+        bhi     arg_error
+        mulu.w  #10,d1
+        ext.w   d0
+        add.w   d0,d1
+        bra.s   page_digit
+page_done          tst.w   d2
+        beq.s   ql_arg_opt_more       ; no digits -> keep auto window height
+        cmpi.w  #2,d1
+        bcc.s   page_set
+        moveq   #2,d1              ; minimum 2 lines per page
+page_set           subq.w  #1,d1              ; reserve 1 line for "-- More --"
+        move.w  d1,page_lim(a3)
+        move.b  #2,opt_page(a3)    ; explicit -pN overrides auto height
+        bra.s   ql_arg_opt_more
+arg_opt_n          move.b  #1,opt_num(a3)
+ql_arg_opt_more       cmpa.l  a2,a1
+        beq     args_done
+        bsr     is_space
+        bne.s   arg_option
+        bra     arg_next
 
 arg_channel        moveq   #0,d1
         moveq   #0,d2
@@ -417,4 +542,5 @@ arg_space          cmpi.b  #' ',d0
         cmpi.b  #9,d0
 space_ok           rts
 num_powers   dc.l   10000,1000,100,10
+more_msg     dc.b   '-- More --'
         end
