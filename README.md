@@ -85,7 +85,7 @@ LBYTES FLP1_qlcat_bin,a
 SEXEC FLP1_qlcat,a,N,1024
 ```
 
-To build the raw resident extension, assemble `qlcat_rext_asm` to `qlcat_rext`
+To build the raw resident extension, assemble `qlcat_s` to `cat_rext`
 and load it directly with `LRESPR`.
 
 ## License
