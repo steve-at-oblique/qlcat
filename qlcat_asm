@@ -14,7 +14,7 @@ io_fbyt      equ 1
 io_fmul      equ 3
 io_sbyt      equ 5
 io_smul      equ 7
-iop_wenq     equ $0a
+iow_chrq     equ $0b
 sv_basic     equ $10
 sv_jobs      equ $68
 job_header   equ $68
@@ -40,11 +40,11 @@ line_num    equ saw_cr+4
 opt_page    equ saw_cr+8            ; 0=off, 1=auto window height, 2=explicit -pN
 page_lim    equ saw_cr+10           ; lines per page before -- More --
 page_cnt    equ saw_cr+12           ; lines printed on current page
-page_cols   equ saw_cr+14           ; columns per row (from IOP.WENQ / 6)
+page_cols   equ saw_cr+14           ; columns per row (from IOW.CHRQ)
 col_cnt     equ saw_cr+16           ; current horizontal column on row
 work_area   equ saw_cr-path_len
 
-start              bra     main
+start              bra.w   main
         dc.w    0
         dc.w    $4afb,3
         dc.b    'CAT',0
@@ -66,7 +66,8 @@ main
         lea     buf_len(a3),a3     ; A3 = path_buf (QDOS string)
         clr.l   saw_cr(a3)         ; clears saw_cr, has_path, opt_numb, at_bol
         clr.l   opt_page(a3)       ; clears opt_page, pad, page_lim.W              ; <--
-        clr.w   page_cnt(a3)       ; clears page_cnt.W         
+        clr.w   page_cnt(a3)
+        clr.w   col_cnt(a3)
         move.b  #1,at_bol(a3)      ; start at beginning of line 1
         moveq   #1,d0
         move.l  d0,line_num(a3)    ; line_num =1
@@ -76,7 +77,6 @@ main
         bne     exit_job
         tst.b   has_path(a3)
         beq     bad_param
-        bsr     init_page          ; <-- detect window height if -p was requested
 
         ; Lead with a newline on the output channel, matching LS/DIR.
         movea.l a4,a0
@@ -86,6 +86,8 @@ main
         trap    #3
         tst.l   d0
         bne     exit_job
+
+        bsr     init_page
 
         ; Open input file (shared read, D3 = 1). If no device prefix was
         ; supplied and DATA_USE is set, prepend DATA_USE first.
@@ -124,14 +126,15 @@ filter_chunk       tst.w   d1
 filter_byte        move.b  (a0)+,d0
         cmpi.b  #13,d0             ; CR ($0D) -> emit LF ($0A), remember CR
         bne.s   not_cr
+        bsr     before_byte
+        bne     eof_done
         bsr     maybe_num          ; number blank lines too
         bne     close_file
         move.b  #10,(a1)+
         move.b  #1,at_bol(a3)      ; next char starts a new line
-        clr.w   col_cnt(a3)        ; <-- reset column on newline
+        clr.w   col_cnt(a3)
         moveq   #1,d5
-        bsr     on_newline         ; check page limit; D0=1 means user quit
-        bne     eof_done
+        bsr     on_newline
         bra     next_byte
 
 not_cr             cmpi.b  #10,d0             ; LF ($0A) -> skip if preceded by CR
@@ -140,13 +143,14 @@ not_cr             cmpi.b  #10,d0             ; LF ($0A) -> skip if preceded by 
         beq.s   emit_lf
         moveq   #0,d5
         bra     next_byte
-emit_lf            bsr   maybe_num
+emit_lf            bsr     before_byte
+        bne     eof_done
+        bsr     maybe_num
         bne     close_file
         move.b  #10,(a1)+
         move.b  #1,at_bol(a3)
-        clr.w   col_cnt(a3)        ; <-- reset column on newline
-        bsr     on_newline         ; check page limit; D0=1 means user quit
-        bne     eof_done
+        clr.w   col_cnt(a3)
+        bsr     on_newline
         bra.s   next_byte
 
 clear_cr           moveq   #0,d5
@@ -156,26 +160,27 @@ clear_cr           moveq   #0,d5
         bcs.s   next_byte
         cmpi.b  #127,d0            ; strip DEL ($7F), allow $20-$7E and $80-$FF
         beq.s   next_byte
-emit_char          bsr   maybe_num
-        bne     close_file
-        move.b  d0,(a1)+
-        bsr     on_col             ; advance column & count wrapped rows
+emit_char          bsr     before_byte
         bne     eof_done
+        bsr     maybe_num
+        bne     close_file
+        bsr     wrap_row
+        bne     eof_done
+        move.b  d0,(a1)+
+        addq.w  #1,col_cnt(a3)
         bra.s   next_byte
 
-emit_tab           bsr   maybe_num          ; tab advances to multiple of 8
+emit_tab           bsr     before_byte
+        bne     eof_done
+        bsr     maybe_num
         bne     close_file
+        bsr     wrap_row
+        bne     eof_done
         move.b  d0,(a1)+
         move.w  col_cnt(a3),d0
-        addi.w  #8,d0 
+        addi.w  #8,d0
         andi.w  #$fff8,d0
         move.w  d0,col_cnt(a3)
-        cmp.w   page_cols(a3),d0
-        bcs.s   next_byte
-        clr.w   col_cnt(a3)
-        bsr     on_newline
-        bne     eof_done
-
 
 next_byte          dbra    d4,filter_byte
         move.b  d5,saw_cr(a3)
@@ -256,57 +261,58 @@ fo_ok              moveq   #0,d0
         movem.l (a7)+,d4-d5/a0
         rts
 
-; Configure page_cols(a3) and page_lim(a3) if -p or -pN was given.
-init_page          move.b  opt_page(a3),d2
+; Query character dimensions using the window's current character size.
+init_page          tst.b   opt_page(a3)
         beq.s   ip_done
-        move.w  #80,page_cols(a3)  ; fallback width if IOP.WENQ unavailable      ; <--
         movea.l a4,a0
-        lea     in_buf(a3),a1      ; 8-byte scratch for IOP.WENQ
+        lea     in_buf(a3),a1
         moveq   #-1,d3
-        moveq   #iop_wenq,d0
+        moveq   #iow_chrq,d0
         trap    #3
         tst.l   d0
-        bne.s   ip_check_mode      ; not a CON_/SCR_ window                     ; <--
-        moveq   #0,d0
-        move.w  0(a1),d0           ; window width in pixels                     ; <--
-        divu    #6,d0              ; 6 pixels per character column              ; <--
-        cmpi.w  #10,d0                                                          ; <--
-        bcs.s   ip_height                                                       ; <--
-        move.w  d0,page_cols(a3)                                                ; <--
-ip_height          cmpi.b  #2,d2                                                ; <--
-        beq.s   ip_done            ; explicit -pN already set page_lim
-        moveq   #0,d0
-        move.w  2(a1),d0           ; window height in pixels
-        divu    #10,d0             ; 10 pixels per character row
-        subq.w  #1,d0              ; leave 1 row for "-- More --"
+        bne.s   ip_disable
+        move.w  in_buf(a3),d0
+        beq.s   ip_disable
+        move.w  d0,page_cols(a3)
+        cmpi.b  #2,opt_page(a3)
+        beq.s   ip_done            ; explicit -pN supplies the row count
+        move.w  in_buf+2(a3),d0
         cmpi.w  #2,d0
-        bcc.s   ip_save
-        moveq   #2,d0
-ip_save            move.w  d0,page_lim(a3)
+        bcs.s   ip_disable
+        subq.w  #1,d0              ; reserve a row for the prompt
+        move.w  d0,page_lim(a3)
         rts
-ip_check_mode      cmpi.b  #2,d2              ; keep explicit -pN even if WENQ fails ; <--
-        beq.s   ip_done                                                         ; <--
-        clr.b   opt_page(a3)
+ip_disable         clr.b   opt_page(a3)
 ip_done            rts
 
-
-; Advance col_cnt by 1; if page_cols reached, wrap to next row and call on_newline.
-on_col  tst.b   opt_page(a3)
-        beq.s   oc_ok
-        addq.w  #1,col_cnt(a3)
-        move.w  col_cnt(a3),d0
-        cmp.w   page_cols(a3),d0
-        bcs.s   oc_ok
+; A full row wraps on the next printable byte. An explicit LF ends
+; the row itself, even when the last character filled the window width.
+wrap_row           tst.b   opt_page(a3)
+        beq.s   wr_ok
+        move.w  col_cnt(a3),d1
+        cmp.w   page_cols(a3),d1
+        bcs.s   wr_ok
         clr.w   col_cnt(a3)
-        bra.s   on_newline
-oc_ok              moveq   #0,d0
+        move.l  d0,-(a7)
+        bsr     on_newline
+        bsr     maybe_page
+        movem.l (a7)+,d0           ; preserve the input byte and status flags
+        rts
+wr_ok              cmp.b   d0,d0
         rts
 
-; Increment page_cnt on newline; if page_lim reached, flush and wait for key.
+before_byte        move.l  d0,-(a7)
+        bsr     maybe_page
+        movem.l (a7)+,d0
+        rts
+
+on_newline         addq.w  #1,page_cnt(a3)
+        rts
+
+; Before emitting more text, flush and wait if the current page is full.
 ; Preserves D4, D5, A0. Returns D0 = 0 to continue, 1 to quit, <0 on I/O error.
-on_newline         tst.b   opt_page(a3)
+maybe_page         tst.b   opt_page(a3)
         beq     on_ok
-        addq.w  #1,page_cnt(a3)
         move.w  page_cnt(a3),d0
         cmp.w   page_lim(a3),d0
         bcs.s   on_ok
@@ -377,16 +383,37 @@ remove_job         moveq   #-1,d1
 bad_param          moveq   #ql_err_bp,d0
         bra.s   exit_job
 
-; If path in (A3) has no underscore and DATA_USE is set, prepend DATA_USE.
+; Apply DATA_USE to relative paths. QDOS device prefixes have the
+; form xxxN_ (or nN_ for the network device), where N is a digit.
 resolve_path       move.w  (a3),d1
-        beq.s   rp_done
+        cmpi.w  #3,d1
+        bcs.s   rp_default
+        move.b  2(a3),d0
+        ori.b   #$20,d0
+        cmpi.b  #'n',d0
+        bne.s   rp_device
+        cmpi.b  #'_',4(a3)
+        bne.s   rp_device
+        move.b  3(a3),d0
+        bra.s   rp_digit
+rp_device          cmpi.w  #5,d1
+        bcs.s   rp_default
+        cmpi.b  #'_',6(a3)
+        bne.s   rp_default
         lea     2(a3),a0
-        move.w  d1,d0
-        subq.w  #1,d0
-rp_scan            cmpi.b  #'_',(a0)+
-        beq.s   rp_done            ; already has a device/directory prefix
-        dbra    d0,rp_scan
+        moveq   #2,d2
+rp_letter          move.b  (a0)+,d0
+        ori.b   #$20,d0
+        subi.b  #'a',d0
+        cmpi.b  #25,d0
+        bhi.s   rp_default
+        dbra    d2,rp_letter
+        move.b  (a0),d0
+rp_digit           subi.b  #'0',d0
+        cmpi.b  #9,d0
+        bls.s   rp_done
 
+rp_default
         move.l  sv_datad(a5),d0
         beq.s   rp_done
         movea.l d0,a0
@@ -463,11 +490,9 @@ page_digit         cmpa.l  a2,a1
         bra.s   page_digit
 page_done          tst.w   d2
         beq.s   ql_arg_opt_more       ; no digits -> keep auto window height
-        cmpi.w  #2,d1
-        bcc.s   page_set
-        moveq   #2,d1              ; minimum 2 lines per page
-page_set           subq.w  #1,d1              ; reserve 1 line for "-- More --"
-        move.w  d1,page_lim(a3)
+        tst.w   d1
+        beq     arg_error          ; an explicit page size must be positive
+page_set           move.w  d1,page_lim(a3)
         move.b  #2,opt_page(a3)    ; explicit -pN overrides auto height
         bra.s   ql_arg_opt_more
 arg_opt_n          move.b  #1,opt_num(a3)

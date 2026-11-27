@@ -11,7 +11,9 @@ stream files of any size cleanly even on a stock 128K Sinclair QL.
 
 ## Install and run
 
-Copy `qlcat` from the project root in binary mode to your drive. For example:
+Transfer `qlcat` with a tool that reads the 30-byte QDOS transfer header and
+restores the native executable metadata. For example, after transferring it to
+`WIN1_`:
 
 ```basic
 EW win1_qlcat;"win1_boot"
@@ -21,8 +23,8 @@ The standalone `qlcat` transfer file includes a 30-byte QDOS header specifying
 file type 1 and 1024 bytes of data space.
 
 By default, QLcat writes a leading newline and then the file contents to the
-main BASIC job's channel `#1`. If a bare filename is given without a device
-prefix, QLcat prepends the current `DATA_USE` directory when set.
+main BASIC job's channel `#1`. QLcat prepends the current `DATA_USE` directory
+to relative names, including names such as `notes_txt`.
 
 ## Command-line options
 
@@ -38,8 +40,8 @@ EW win1_qlcat,#3;"-n win1_qlcat_asm"
 ```
 
 - `-n` prefixes each line with a right-aligned 5-digit line number and space.
-- `-p` paginates output using the target window's detected height (`IOP.WENQ`), displaying `-- More --` at the bottom of each page. Press `SPACE` or `ENTER` to continue, or `CTRL-SPACE`, `Q`, or `ESC` to quit early. Pagination automatically disables if output is redirected to a non-window channel such as a file.
-- `-p<N>` paginates every `<N>` lines (for example, `-p20`).
+- `-p` paginates output using the target window's character dimensions (`IOW.CHRQ`), displaying `-- More --` at the bottom of each page. Press `SPACE` or `ENTER` to continue, or `CTRL-SPACE`, `Q`, or `ESC` to quit early. Pagination automatically disables if output is redirected to a non-window channel such as a file.
+- `-p<N>` paginates after every `<N>` displayed rows (for example, `-p20`).
 - `#n` redirects output to an open SuperBASIC channel `#n` (with an optional comma or space before the path). Passing an open channel directly to `EW` or `EXEC_W` (such as `EW win1_qlcat,#3;"win1_file"`) is also supported.
 
 Combine options (such as `"-np"` or `"-np15"`) or pass them separately before or
@@ -48,11 +50,11 @@ quotes inside a single-quoted BASIC string, as in `EW win1_qlcat;'-n "WIN1_My Fi
 
 ## Resident BASIC command
 
-Transfer `qlcat_rext` as a raw binary and `qlcat` as a QDOS executable.
-Load the extension once per boot with Toolkit II or SMSQ/E:
+Transfer `cat_rext` as a raw binary and `qlcat` as a QDOS executable.
+Load the extension once per boot:
 
 ```basic
-LRESPR win1_qlcat_rext
+LRESPR win1_cat_rext
 CAT_USE "win1_qlcat"
 CAT win1_qlcat_asm
 CAT win1_qlcat_asm,"-np"
@@ -67,26 +69,45 @@ to finish.
 
 ## Build with Talent/Quanta Assembler Workbench 2.02
 
-Copy `qlcat_asm` as plain text. In the monitor, assemble the executable binary
-(replace `FLP1_` with your source/output drive):
+Transfer `qlcat_asm` and `qlcat_s` to the QL as plain text. These examples
+use the `snl6_` drive prefix. Substitute your own drive as needed.
+`cmd>` is the Workbench monitor prompt and `asm>` is the assembler prompt.
+
+### Assemble the executable
 
 ```text
-ASM 0 FLP1_
-OUT FLP1_qlcat_bin
-INCLUDE FLP1_qlcat_asm
+cmd> heap &3000
+cmd> asm <start> snl6_
+asm> in snl6_qlcat_asm
+cmd> sexec snl6_qlcat <start> <end> &1024
 ```
 
-From SuperBASIC, save the assembled binary (size `N` bytes) with the required
-1024-byte data space:
+Use the address printed by `heap` for `<start>` and the assembly end
+address for `<end>`. The source's `END` directive returns you to the
+monitor. `sexec` saves a native executable with 1024 bytes of data space.
 
-```basic
-a=RESPR(N)
-LBYTES FLP1_qlcat_bin,a
-SEXEC FLP1_qlcat,a,N,1024
+### Assemble the resident extension
+
+```text
+cmd> heap &3000
+cmd> asm <start> snl6_
+asm> in snl6_qlcat_s
+cmd> sbytes snl6_cat_rext <start> <end>
 ```
 
-To build the raw resident extension, assemble `qlcat_s` to `cat_rext`
-and load it directly with `LRESPR`.
+Use the addresses from the extension's own assembly. `sbytes` saves
+`cat_rext` as a raw binary for `LRESPR`. On stock QDOS, reserve the
+extension's size with `RESPR`, load it at that address with `LBYTES`,
+and initialize it with `CALL`.
+
+When copying the native executable back to the host, use a transfer tool
+that exports it with the 30-byte QDOS header. If your tool exports only
+the raw code, save that as `qlcat_bin` on the host and add the header
+before shipping it as `qlcat`:
+
+```sh
+python3 -c 'from pathlib import Path; from struct import pack; Path("qlcat").write_bytes(b"]!QDOS File Header" + pack(">HBBII", 15, 0, 1, 1024, 0) + Path("qlcat_bin").read_bytes())'
+```
 
 ## License
 
